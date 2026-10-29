@@ -1,5 +1,7 @@
 name: check
 on:
+  schedule:
+    - cron: "7,37 * * * *"
   workflow_dispatch:
     inputs:
       test:
@@ -9,6 +11,7 @@ on:
 jobs:
   run:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -25,3 +28,4 @@ jobs:
         with:
           name: result
           path: "*.png"
+          retention-days: 1

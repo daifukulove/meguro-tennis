@@ -1,17 +1,23 @@
 name: check
 on:
   schedule:
-    - cron: "7,37 * * * *"
+    - cron: "3,33 * * * *"
   workflow_dispatch:
     inputs:
       test:
         description: "テスト通知を送る"
         type: boolean
         default: false
+      minutes:
+        description: "繰り返す時間（分）"
+        default: "1"
+concurrency:
+  group: check
+  cancel-in-progress: false
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -23,9 +29,12 @@ jobs:
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
           TEST_NOTIFY: ${{ inputs.test }}
+          LOOP_MINUTES: ${{ inputs.minutes || '27' }}
+          INTERVAL_SEC: "180"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: result
           path: "*.png"
           retention-days: 1
+          if-no-files-found: ignore

@@ -39,40 +39,45 @@ async def settle(page):
         await page.wait_for_load_state("networkidle", timeout=15000)
     except Exception:
         pass
-    await page.wait_for_timeout(1200)
+    await page.wait_for_timeout(1500)
+
+
+async def retry(coro_fn, tries=4, wait=2000, page=None):
+    last = None
+    for _ in range(tries):
+        try:
+            return await coro_fn()
+        except Exception as e:
+            last = e
+            if page:
+                await page.wait_for_timeout(wait)
+    raise last
 
 
 async def debug_dump(page, label):
     print(f"\n--- デバッグ: {label} ---")
-    print("URL:", page.url)
     try:
-        info = await page.evaluate(
-            """()=>[...document.querySelectorAll('input,a[id],select')]
-                .filter(e=>e.id && !e.id.startsWith('checkPurpose') && !e.id.startsWith('checkdate'))
-                .map(e=>e.id+(e.type?'('+e.type+')':'')+(e.checked!==undefined?'='+e.checked:'')
-                  +(e.offsetParent===null?' [非表示]':''))"""
-        )
-        for i in info:
-            print(i)
+        print("URL:", page.url)
         print((await page.inner_text("body"))[:1500])
     except Exception as e:
         print("デバッグ取得に失敗:", e)
-    await page.screenshot(path="debug.png", full_page=True)
+    try:
+        await page.screenshot(path="debug.png", full_page=True)
+    except Exception:
+        pass
 
 
 async def set_checked(page, id_, want):
-    changed = await page.evaluate(
+    r = await page.evaluate(
         """([id,want])=>{const e=document.getElementById(id);
             if(!e) return 'none';
             if(e.checked===want) return 'same';
             e.click(); return 'clicked';}""",
         [id_, want],
     )
-    if changed == "none":
-        print(f"  {id_}: 要素なし")
-    elif changed == "clicked":
+    if r == "clicked":
         await settle(page)
-    return changed
+    return r
 
 
 async def main():
@@ -91,6 +96,13 @@ async def main():
         await page.locator('label:has-text("宮前公園庭球場")').first.click()
         await page.wait_for_timeout(500)
         await page.locator('a:has-text("次へ進む")').first.click()
+
+        # カレンダー画面の部品が出るまで待つ
+        try:
+            await page.wait_for_selector("#radioPeriod1month", state="attached", timeout=30000)
+        except Exception:
+            await debug_dump(page, "カレンダー画面に進めない")
+            sys.exit(1)
         await settle(page)
         print("カレンダー画面URL:", page.url)
 
@@ -107,7 +119,7 @@ async def main():
             r = await set_checked(page, id_, want)
             print(f"  {id_} -> {want}: {r}")
 
-        # 表示ボタン
+        # 表示ボタン（画面が切り替わるのを待つ）
         try:
             await page.wait_for_selector("#btnHyoji", state="attached", timeout=15000)
             await page.evaluate("document.getElementById('btnHyoji').click()")
@@ -115,16 +127,28 @@ async def main():
             print("表示ボタンの操作に失敗:", str(e)[:200])
             await debug_dump(page, "表示ボタン失敗")
             sys.exit(1)
+        await page.wait_for_timeout(4000)
         await settle(page)
 
-        state = await page.evaluate(
-            """()=>['radioPeriod1month','radioJikan2','checkYobi1','checkYobi5','checkYobi6','checkYobi7','checkYobi2']
-                .map(id=>id+'='+(document.getElementById(id)||{}).checked).join(', ')"""
-        )
-        print("絞り込み状態:", state)
-        await page.screenshot(path="result.png", full_page=True)
+        # 設定の確認（失敗しても続行）
+        try:
+            state = await retry(
+                lambda: page.evaluate(
+                    """()=>['radioPeriod1month','radioJikan2','checkYobi1','checkYobi5','checkYobi6','checkYobi7','checkYobi2']
+                        .map(id=>id+'='+(document.getElementById(id)||{}).checked).join(', ')"""
+                ),
+                page=page,
+            )
+            print("絞り込み状態:", state)
+        except Exception as e:
+            print("絞り込み状態の確認はスキップ:", str(e)[:100])
 
-        text = await page.inner_text("body")
+        try:
+            await page.screenshot(path="result.png", full_page=True)
+        except Exception:
+            pass
+
+        text = await retry(lambda: page.inner_text("body"), page=page)
         start = text.find("定員")
         end = text.find("次へ進む", start)
         region = text[start:end] if start >= 0 else ""

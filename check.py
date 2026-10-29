@@ -1,15 +1,16 @@
 import asyncio
 import os
 import re
-import sys
+import time
 import urllib.request
 from playwright.async_api import async_playwright
 
 BASE = "https://resv.city.meguro.tokyo.jp/Web/"
 TOPIC = os.environ.get("NTFY_TOPIC", "")
 TEST = os.environ.get("TEST_NOTIFY") == "true"
+LOOP_MINUTES = float(os.environ.get("LOOP_MINUTES", "1") or "1")
+INTERVAL_SEC = int(os.environ.get("INTERVAL_SEC", "180") or "180")
 
-# 対象の曜日（True=見る）
 WEEKDAYS = {
     "checkYobi1": True,   # 月
     "checkYobi2": False,  # 火
@@ -28,7 +29,10 @@ def notify(msg):
         print("NTFY_TOPIC が未設定です")
         return
     req = urllib.request.Request(
-        f"https://ntfy.sh/{TOPIC}", data=msg.encode("utf-8"), method="POST"
+        f"https://ntfy.sh/{TOPIC}",
+        data=msg.encode("utf-8"),
+        method="POST",
+        headers={"Priority": "high"},
     )
     urllib.request.urlopen(req, timeout=20)
     print("通知を送信しました")
@@ -39,32 +43,19 @@ async def settle(page):
         await page.wait_for_load_state("networkidle", timeout=15000)
     except Exception:
         pass
-    await page.wait_for_timeout(1500)
+    await page.wait_for_timeout(1200)
 
 
-async def retry(coro_fn, tries=4, wait=2000, page=None):
+async def retry(fn, tries=4, wait=2000, page=None):
     last = None
     for _ in range(tries):
         try:
-            return await coro_fn()
+            return await fn()
         except Exception as e:
             last = e
             if page:
                 await page.wait_for_timeout(wait)
     raise last
-
-
-async def debug_dump(page, label):
-    print(f"\n--- デバッグ: {label} ---")
-    try:
-        print("URL:", page.url)
-        print((await page.inner_text("body"))[:1500])
-    except Exception as e:
-        print("デバッグ取得に失敗:", e)
-    try:
-        await page.screenshot(path="debug.png", full_page=True)
-    except Exception:
-        pass
 
 
 async def set_checked(page, id_, want):
@@ -80,73 +71,35 @@ async def set_checked(page, id_, want):
     return r
 
 
-async def main():
-    if TEST:
-        notify("テスト通知：目黒テニス空き監視からの通知です")
-
-    async with async_playwright() as p:
-        browser = await p.chromium.launch()
-        page = await browser.new_page(viewport={"width": 1280, "height": 1800})
+async def check_once(browser):
+    """空いている日のリスト（例: ['31日(土)○']）を返す。失敗時は例外。"""
+    context = await browser.new_context(viewport={"width": 1280, "height": 1800})
+    page = await context.new_page()
+    try:
         await page.goto(BASE)
         await settle(page)
-
         await page.locator("#category_01").click()
         await settle(page)
-
         await page.locator('label:has-text("宮前公園庭球場")').first.click()
         await page.wait_for_timeout(500)
         await page.locator('a:has-text("次へ進む")').first.click()
-
-        # カレンダー画面の部品が出るまで待つ
-        try:
-            await page.wait_for_selector("#radioPeriod1month", state="attached", timeout=30000)
-        except Exception:
-            await debug_dump(page, "カレンダー画面に進めない")
-            sys.exit(1)
+        await page.wait_for_selector("#radioPeriod1month", state="attached", timeout=30000)
         await settle(page)
-        print("カレンダー画面URL:", page.url)
 
-        # 絞り込み欄を開く
         try:
             await page.locator("#btnShowDetail").click(timeout=5000)
             await settle(page)
-        except Exception as e:
-            print("詳細ボタンはスキップ:", str(e)[:80])
-
-        # 1項目ずつ設定（1ヶ月・午後・対象曜日）
-        targets = {"radioPeriod1month": True, "radioJikan2": True, **WEEKDAYS}
-        for id_, want in targets.items():
-            r = await set_checked(page, id_, want)
-            print(f"  {id_} -> {want}: {r}")
-
-        # 表示ボタン（画面が切り替わるのを待つ）
-        try:
-            await page.wait_for_selector("#btnHyoji", state="attached", timeout=15000)
-            await page.evaluate("document.getElementById('btnHyoji').click()")
-        except Exception as e:
-            print("表示ボタンの操作に失敗:", str(e)[:200])
-            await debug_dump(page, "表示ボタン失敗")
-            sys.exit(1)
-        await page.wait_for_timeout(4000)
-        await settle(page)
-
-        # 設定の確認（失敗しても続行）
-        try:
-            state = await retry(
-                lambda: page.evaluate(
-                    """()=>['radioPeriod1month','radioJikan2','checkYobi1','checkYobi5','checkYobi6','checkYobi7','checkYobi2']
-                        .map(id=>id+'='+(document.getElementById(id)||{}).checked).join(', ')"""
-                ),
-                page=page,
-            )
-            print("絞り込み状態:", state)
-        except Exception as e:
-            print("絞り込み状態の確認はスキップ:", str(e)[:100])
-
-        try:
-            await page.screenshot(path="result.png", full_page=True)
         except Exception:
             pass
+
+        targets = {"radioPeriod1month": True, "radioJikan2": True, **WEEKDAYS}
+        for id_, want in targets.items():
+            await set_checked(page, id_, want)
+
+        await page.wait_for_selector("#btnHyoji", state="attached", timeout=15000)
+        await page.evaluate("document.getElementById('btnHyoji').click()")
+        await page.wait_for_timeout(4000)
+        await settle(page)
 
         text = await retry(lambda: page.inner_text("body"), page=page)
         start = text.find("定員")
@@ -156,27 +109,59 @@ async def main():
         row = region.find("庭球場")
         symbols = re.findall(r"[○△×－＊]", region[row:]) if row >= 0 else []
         if len(symbols) == len(dates) + 1:
-            symbols = symbols[1:]  # 先頭は定員欄の「－」
-
-        print("日付数:", len(dates), "記号数:", len(symbols))
-        print(list(zip(dates, symbols)))
-
+            symbols = symbols[1:]
         if not dates or len(dates) != len(symbols):
-            print("解析に失敗しました。画面テキスト：")
-            print(region[:2000])
-            await debug_dump(page, "解析失敗")
-            sys.exit(1)
+            try:
+                await page.screenshot(path="debug.png", full_page=True)
+            except Exception:
+                pass
+            raise RuntimeError(f"解析失敗 日付{len(dates)} 記号{len(symbols)}")
 
-        found = [
+        print(f"日付{len(dates)}件 / 空き候補: ",
+              [(f'{d}{w}', s) for (d, w), s in zip(dates, symbols) if s in "○△"])
+        return [
             f"{d}日({w}){s}"
             for (d, w), s in zip(dates, symbols)
             if s in "○△" and w in WANT_DAYS
         ]
-        if found:
-            notify("宮前公園庭球場（午後）に空き：" + "、".join(found) + "\n" + BASE)
-        else:
-            print("空きなし")
+    finally:
+        await context.close()
+
+
+async def main():
+    if TEST:
+        notify("テスト通知：目黒テニス空き監視からの通知です")
+
+    deadline = time.time() + LOOP_MINUTES * 60
+    prev = set()
+    ok_count = 0
+    ng_count = 0
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch()
+        while True:
+            t0 = time.time()
+            try:
+                found = set(await check_once(browser))
+                ok_count += 1
+                new = found - prev
+                if new:
+                    notify("宮前公園庭球場（午後）に空き：" + "、".join(sorted(new)) + "\n" + BASE)
+                else:
+                    print("新しい空きなし" if not found else "空きは通知済み")
+                prev = found
+            except Exception as e:
+                ng_count += 1
+                print("今回の確認は失敗:", str(e)[:200])
+            wait = max(INTERVAL_SEC - (time.time() - t0), 30)
+            if time.time() + wait > deadline:
+                break
+            await asyncio.sleep(wait)
         await browser.close()
+
+    print(f"終了: 成功{ok_count}回 / 失敗{ng_count}回")
+    if ok_count == 0:
+        raise SystemExit(1)
 
 
 asyncio.run(main())

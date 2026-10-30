@@ -3,6 +3,7 @@ import os
 import re
 import time
 import urllib.request
+from datetime import date
 from playwright.async_api import async_playwright
 
 BASE = "https://resv.city.meguro.tokyo.jp/Web/"
@@ -11,6 +12,7 @@ TEST = os.environ.get("TEST_NOTIFY") == "true"
 LOOP_MINUTES = float(os.environ.get("LOOP_MINUTES", "1") or "1")
 INTERVAL_SEC = int(os.environ.get("INTERVAL_SEC", "180") or "180")
 
+# カレンダーの表示曜日
 WEEKDAYS = {
     "checkYobi1": True,   # 月
     "checkYobi2": False,  # 火
@@ -21,7 +23,9 @@ WEEKDAYS = {
     "checkYobi7": True,   # 日
     "checkYobi8": False,  # 祝
 }
-WANT_DAYS = "日月金土"
+WANT_WEEKDAYS = {0, 4, 5, 6}  # 月=0 ... 日=6
+MIN_START_HOUR = 13           # この時刻以降に始まる枠だけ通知
+YOBI = "月火水木金土日"
 
 
 def notify(msg):
@@ -71,8 +75,15 @@ async def set_checked(page, id_, want):
     return r
 
 
+async def shot(page, name):
+    try:
+        await page.screenshot(path=name, full_page=True)
+    except Exception:
+        pass
+
+
 async def check_once(browser):
-    """空いている日のリスト（例: ['31日(土)○']）を返す。失敗時は例外。"""
+    """空き枠の {キー: 表示文字列} を返す。失敗時は例外。"""
     context = await browser.new_context(viewport={"width": 1280, "height": 1800})
     page = await context.new_page()
     try:
@@ -92,7 +103,8 @@ async def check_once(browser):
         except Exception:
             pass
 
-        targets = {"radioPeriod1month": True, "radioJikan2": True, **WEEKDAYS}
+        # 1ヶ月・全日・対象曜日
+        targets = {"radioPeriod1month": True, "radioJikan4": True, **WEEKDAYS}
         for id_, want in targets.items():
             await set_checked(page, id_, want)
 
@@ -101,29 +113,93 @@ async def check_once(browser):
         await page.wait_for_timeout(4000)
         await settle(page)
 
+        # カレンダーの記号を読む
         text = await retry(lambda: page.inner_text("body"), page=page)
         start = text.find("定員")
         end = text.find("次へ進む", start)
         region = text[start:end] if start >= 0 else ""
-        dates = re.findall(r"(\d{1,2})\s*\n\s*([月火水木金土日])", region)
         row = region.find("庭球場")
         symbols = re.findall(r"[○△×－＊]", region[row:]) if row >= 0 else []
-        if len(symbols) == len(dates) + 1:
-            symbols = symbols[1:]
-        if not dates or len(dates) != len(symbols):
-            try:
-                await page.screenshot(path="debug.png", full_page=True)
-            except Exception:
-                pass
-            raise RuntimeError(f"解析失敗 日付{len(dates)} 記号{len(symbols)}")
 
-        print(f"日付{len(dates)}件 / 空き候補: ",
-              [(f'{d}{w}', s) for (d, w), s in zip(dates, symbols) if s in "○△"])
-        return [
-            f"{d}日({w}){s}"
-            for (d, w), s in zip(dates, symbols)
-            if s in "○△" and w in WANT_DAYS
-        ]
+        vals = await retry(
+            lambda: page.evaluate(
+                "()=>[...document.querySelectorAll('input[name=checkdate]')].map(e=>e.value)"
+            ),
+            page=page,
+        )
+        if len(symbols) == len(vals) + 1:
+            symbols = symbols[1:]  # 先頭は定員欄の「－」
+        if not vals or len(symbols) != len(vals):
+            await shot(page, "debug.png")
+            raise RuntimeError(f"カレンダー解析失敗 日付{len(vals)} 記号{len(symbols)}")
+
+        cand = []
+        for i, (v, s) in enumerate(zip(vals, symbols)):
+            if s not in "○△":
+                continue
+            y, m, d = int(v[:4]), int(v[4:6]), int(v[6:8])
+            if date(y, m, d).weekday() in WANT_WEEKDAYS:
+                cand.append((i, y, m, d, s))
+
+        print(f"カレンダー: {len(vals)}日中、候補{len(cand)}日",
+              [f"{m}/{d}{s}" for _, _, m, d, s in cand])
+        if not cand:
+            return {}
+
+        # 候補日を選んで時間帯画面へ
+        await page.evaluate(
+            """(idx)=>{const b=[...document.querySelectorAll('input[name=checkdate]')];
+                idx.forEach(i=>{if(!b[i].checked) b[i].click();});}""",
+            [c[0] for c in cand],
+        )
+        await page.wait_for_timeout(500)
+        await page.locator('a:has-text("次へ進む")').first.click()
+        await page.wait_for_url("**/WgR_JikantaibetsuAkiJoukyou*", timeout=30000)
+        await settle(page)
+
+        # 時間帯画面の表を読む
+        tables = await retry(
+            lambda: page.evaluate(
+                """()=>[...document.querySelectorAll('table')]
+                    .filter(t=>!t.querySelector('table'))
+                    .map(t=>[...t.rows].map(r=>[...r.cells].map(c=>c.innerText.replace(/\\s+/g,' ').trim())))"""
+            ),
+            page=page,
+        )
+
+        free = {}
+        for t in tables:
+            if not t:
+                continue
+            head = t[0]
+            m = re.search(r"(\d{4})年(\d{1,2})月(\d{1,2})日", head[0] if head else "")
+            if not m:
+                continue
+            y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+            slots = []
+            for c in head:
+                mm = re.search(r"(\d{1,2}):(\d{2})\s*～\s*(\d{1,2}):(\d{2})", c)
+                if mm:
+                    slots.append((int(mm.group(1)), c))
+            n = len(slots)
+            if n == 0:
+                continue
+            wd = YOBI[date(y, mo, d).weekday()]
+            for r in t[1:]:
+                if len(r) < n + 1:
+                    continue
+                name = r[0] or "コート"
+                syms = r[-n:]
+                for (hour, label), s in zip(slots, syms):
+                    if hour >= MIN_START_HOUR and "○" in s:
+                        key = f"{y}{mo:02d}{d:02d}|{label}|{name}"
+                        free[key] = f"{mo}/{d}({wd}) {label.replace(' ', '')} {name}"
+
+        print("時間帯画面の空き:", list(free.values()) or "なし")
+        if not tables:
+            await shot(page, "debug.png")
+            raise RuntimeError("時間帯画面の表が見つかりません")
+        return free
     finally:
         await context.close()
 
@@ -142,14 +218,15 @@ async def main():
         while True:
             t0 = time.time()
             try:
-                found = set(await check_once(browser))
+                free = await check_once(browser)
                 ok_count += 1
-                new = found - prev
+                new = [k for k in free if k not in prev]
                 if new:
-                    notify("宮前公園庭球場（午後）に空き：" + "、".join(sorted(new)) + "\n" + BASE)
+                    lines = "\n".join(free[k] for k in sorted(new))
+                    notify("宮前公園庭球場に空き：\n" + lines + "\n" + BASE)
                 else:
-                    print("新しい空きなし" if not found else "空きは通知済み")
-                prev = found
+                    print("新しい空きなし" if not free else "空きは通知済み")
+                prev = set(free)
             except Exception as e:
                 ng_count += 1
                 print("今回の確認は失敗:", str(e)[:200])

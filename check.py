@@ -26,6 +26,7 @@ WEEKDAYS = {
 WANT_WEEKDAYS = {0, 4, 5, 6}  # 月=0 ... 日=6
 MIN_START_HOUR = 13           # この時刻以降に始まる枠だけ通知
 YOBI = "月火水木金土日"
+SYMS = "○△×－＊"
 
 
 def notify(msg):
@@ -82,6 +83,52 @@ async def shot(page, name):
         pass
 
 
+def first_symbol(t):
+    for ch in t:
+        if ch in SYMS:
+            return ch
+    return ""
+
+
+async def read_calendar(page):
+    """[(checkdate_index, value, symbol), ...] を返す。"""
+    cells = await retry(
+        lambda: page.evaluate(
+            """()=>[...document.querySelectorAll('input[name=checkdate]')].map(b=>{
+                const td=b.closest('td');
+                return {v:b.value, t: td ? td.innerText.replace(/\\s+/g,'') : ''};
+            })"""
+        ),
+        page=page,
+    )
+    vals = [c["v"] for c in cells]
+    syms = [first_symbol(c["t"]) for c in cells]
+
+    # 方法1: チェックボックスと同じセルの記号を使う
+    if vals and all(syms):
+        print("カレンダー読み取り: セル方式", len(vals), "日")
+        return list(zip(range(len(vals)), vals, syms))
+
+    # 方法2: 本文の記号列から読む（先頭の定員欄と、末尾の期間外「－」は除く）
+    text = await retry(lambda: page.inner_text("body"), page=page)
+    start = text.find("定員")
+    end = text.find("次へ進む", start)
+    region = text[start:end] if start >= 0 else ""
+    row = region.find("庭球場")
+    symbols = re.findall(r"[○△×－＊]", region[row:]) if row >= 0 else []
+    if len(symbols) > len(vals):
+        symbols = symbols[1:]  # 定員欄
+    extra = symbols[len(vals):]
+    symbols = symbols[:len(vals)]
+    if not vals or len(symbols) != len(vals) or any(s not in "－＊" for s in extra):
+        await shot(page, "debug.png")
+        print("セル内容:", [c["t"][:10] for c in cells])
+        print("記号列:", symbols, "余り:", extra)
+        raise RuntimeError(f"カレンダー解析失敗 日付{len(vals)} 記号{len(symbols)}+{len(extra)}")
+    print("カレンダー読み取り: 記号列方式", len(vals), "日")
+    return list(zip(range(len(vals)), vals, symbols))
+
+
 async def check_once(browser):
     """空き枠の {キー: 表示文字列} を返す。失敗時は例外。"""
     context = await browser.new_context(viewport={"width": 1280, "height": 1800})
@@ -113,35 +160,17 @@ async def check_once(browser):
         await page.wait_for_timeout(4000)
         await settle(page)
 
-        # カレンダーの記号を読む
-        text = await retry(lambda: page.inner_text("body"), page=page)
-        start = text.find("定員")
-        end = text.find("次へ進む", start)
-        region = text[start:end] if start >= 0 else ""
-        row = region.find("庭球場")
-        symbols = re.findall(r"[○△×－＊]", region[row:]) if row >= 0 else []
-
-        vals = await retry(
-            lambda: page.evaluate(
-                "()=>[...document.querySelectorAll('input[name=checkdate]')].map(e=>e.value)"
-            ),
-            page=page,
-        )
-        if len(symbols) == len(vals) + 1:
-            symbols = symbols[1:]  # 先頭は定員欄の「－」
-        if not vals or len(symbols) != len(vals):
-            await shot(page, "debug.png")
-            raise RuntimeError(f"カレンダー解析失敗 日付{len(vals)} 記号{len(symbols)}")
+        days = await read_calendar(page)
 
         cand = []
-        for i, (v, s) in enumerate(zip(vals, symbols)):
+        for i, v, s in days:
             if s not in "○△":
                 continue
             y, m, d = int(v[:4]), int(v[4:6]), int(v[6:8])
             if date(y, m, d).weekday() in WANT_WEEKDAYS:
                 cand.append((i, y, m, d, s))
 
-        print(f"カレンダー: {len(vals)}日中、候補{len(cand)}日",
+        print(f"カレンダー: {len(days)}日中、候補{len(cand)}日",
               [f"{m}/{d}{s}" for _, _, m, d, s in cand])
         if not cand:
             return {}

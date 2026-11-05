@@ -3,7 +3,7 @@ import os
 import re
 import time
 import urllib.request
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from playwright.async_api import async_playwright
 
 BASE = "https://resv.city.meguro.tokyo.jp/Web/"
@@ -25,8 +25,19 @@ WEEKDAYS = {
 }
 WANT_WEEKDAYS = {0, 4, 5, 6}  # 月=0 ... 日=6
 MIN_START_HOUR = 13           # この時刻以降に始まる枠だけ通知
+MAX_DAYS_AHEAD = 27           # 今日からこの日数先まで通知（28日後は申込不可のため27）
 YOBI = "月火水木金土日"
 SYMS = "○△×－＊"
+JST = timezone(timedelta(hours=9))
+
+
+def today_jst():
+    return datetime.now(JST).date()
+
+
+def in_range(d):
+    diff = (d - today_jst()).days
+    return 0 <= diff <= MAX_DAYS_AHEAD
 
 
 def notify(msg):
@@ -167,9 +178,11 @@ async def check_once(browser):
             if s not in "○△":
                 continue
             y, m, d = int(v[:4]), int(v[4:6]), int(v[6:8])
-            if date(y, m, d).weekday() in WANT_WEEKDAYS:
+            dt = date(y, m, d)
+            if dt.weekday() in WANT_WEEKDAYS and in_range(dt):
                 cand.append((i, y, m, d, s))
 
+        print(f"今日(JST)={today_jst()} / 対象は{MAX_DAYS_AHEAD}日先まで")
         print(f"カレンダー: {len(days)}日中、候補{len(cand)}日",
               [f"{m}/{d}{s}" for _, _, m, d, s in cand])
         if not cand:
@@ -205,6 +218,8 @@ async def check_once(browser):
             if not m:
                 continue
             y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+            if not in_range(date(y, mo, d)):
+                continue
             slots = []
             for c in head:
                 mm = re.search(r"(\d{1,2}):(\d{2})\s*～\s*(\d{1,2}):(\d{2})", c)

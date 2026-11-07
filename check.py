@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import re
 import time
@@ -11,6 +12,7 @@ TOPIC = os.environ.get("NTFY_TOPIC", "")
 TEST = os.environ.get("TEST_NOTIFY") == "true"
 LOOP_MINUTES = float(os.environ.get("LOOP_MINUTES", "1") or "1")
 INTERVAL_SEC = int(os.environ.get("INTERVAL_SEC", "180") or "180")
+STATE_FILE = "state.json"
 
 # カレンダーの表示曜日
 WEEKDAYS = {
@@ -25,7 +27,7 @@ WEEKDAYS = {
 }
 WANT_WEEKDAYS = {0, 4, 5, 6}  # 月=0 ... 日=6
 MIN_START_HOUR = 13           # この時刻以降に始まる枠だけ通知
-MAX_DAYS_AHEAD = 27           # 今日からこの日数先まで通知（28日後は申込不可のため27）
+MAX_DAYS_AHEAD = 13           # 今日からこの日数先まで通知（今日を含め14日間）
 YOBI = "月火水木金土日"
 SYMS = "○△×－＊"
 JST = timezone(timedelta(hours=9))
@@ -38,6 +40,22 @@ def today_jst():
 def in_range(d):
     diff = (d - today_jst()).days
     return 0 <= diff <= MAX_DAYS_AHEAD
+
+
+def load_state():
+    try:
+        with open(STATE_FILE, encoding="utf-8") as f:
+            return set(json.load(f))
+    except Exception:
+        return set()
+
+
+def save_state(keys):
+    try:
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(sorted(keys), f, ensure_ascii=False)
+    except Exception as e:
+        print("状態の保存に失敗:", e)
 
 
 def notify(msg):
@@ -253,7 +271,9 @@ async def main():
         notify("テスト通知：目黒テニス空き監視からの通知です")
 
     deadline = time.time() + LOOP_MINUTES * 60
-    prev = set()
+    prev = load_state()
+    print("前回までの通知済み:", len(prev), "件")
+    save_state(prev)  # ファイルを必ず作っておく
     ok_count = 0
     ng_count = 0
 
@@ -270,7 +290,8 @@ async def main():
                     notify("宮前公園庭球場に空き：\n" + lines + "\n" + BASE)
                 else:
                     print("新しい空きなし" if not free else "空きは通知済み")
-                prev = set(free)
+                prev = set(free)  # 埋まった枠は忘れる（再び空けば再通知）
+                save_state(prev)
             except Exception as e:
                 ng_count += 1
                 print("今回の確認は失敗:", str(e)[:200])

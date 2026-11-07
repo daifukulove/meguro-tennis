@@ -23,6 +23,11 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - uses: actions/cache/restore@v4
+        with:
+          path: state.json
+          key: state-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: state-
       - run: pip install playwright
       - run: playwright install --with-deps chromium
       - run: python check.py
@@ -31,6 +36,11 @@ jobs:
           TEST_NOTIFY: ${{ inputs.test }}
           LOOP_MINUTES: ${{ inputs.minutes || '27' }}
           INTERVAL_SEC: "180"
+      - uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: state.json
+          key: state-${{ github.run_id }}-${{ github.run_attempt }}
       - uses: actions/upload-artifact@v4
         if: always()
         with:

@@ -29,7 +29,15 @@ jobs:
           key: state-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: state-
       - run: pip install playwright
-      - run: playwright install --with-deps chromium
+      - name: Install Playwright (retry)
+        run: |
+          ok=0
+          for i in 1 2 3; do
+            if playwright install --with-deps chromium; then ok=1; break; fi
+            echo "失敗しました。やり直します ($i/3)"
+            sleep 20
+          done
+          [ "$ok" = 1 ]
       - run: python check.py
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
